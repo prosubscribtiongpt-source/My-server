@@ -1,0 +1,278 @@
+
+name: Business Operations - Windows Server 2022
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Session duration (15-350 minutes)"
+        required: true
+        default: 350
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  windows-server:
+    name: Business Remote Workstation
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+
+      # 1. Validate session duration
+      - name: Validate Configuration
+        shell: pwsh
+        run: |
+          $minutes = [int]"${{ inputs.duration_minutes }}"
+
+          if ($minutes -lt 15 -or $minutes -gt 350) {
+            throw "Duration must be between 15 and 350 minutes."
+          }
+
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes($minutes)
+
+          "RUN_DEADLINE=$($deadline.ToUnixTimeSeconds())" |
+            Out-File $env:GITHUB_ENV -Append
+
+      # 2. Configure secure RDP
+      - name: Configure Remote Desktop
+        shell: pwsh
+        run: |
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1
+
+          # Disable broader default RDP firewall rules
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          # Create restricted RDP firewall rule
+          Get-NetFirewallRule -DisplayName 'Secure-Tailscale-RDP' `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName 'Secure-Tailscale-RDP' `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' `
+            -Action Allow `
+            -Profile Any
+
+          Start-Service TermService
+
+          Write-Host "Secure RDP configured."
+
+      # 3. Configure Business RDP account
+      - name: Configure Business RDP Account
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $username = "BusinessUser"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret is missing."
+          }
+
+          if ($env:RDP_PASSWORD.Length -lt 14) {
+            throw "Password must contain at least 14 characters."
+          }
+
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          $existing = Get-LocalUser -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($existing) {
+            Set-LocalUser -Name $username `
+              -Password $securePassword
+          }
+          else {
+            New-LocalUser `
+              -Name $username `
+              -Password $securePassword `
+              -FullName "Business Operations User" `
+              -Description "Business Remote Workstation"
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          "RDP_USERNAME=$username" |
+            Out-File $env:GITHUB_ENV -Append
+
+          Write-Host "Business account configured."
+
+      # 4. Connect Tailscale
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      # 5. Get Tailscale IP
+      - name: Get Private Network Address
+        shell: pwsh
+        run: |
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 20; $i++) {
+            $result = & tailscale ip -4 2>$null
+
+            if ($LASTEXITCODE -eq 0 -and $result) {
+              $tsIP = ($result | Select-Object -First 1).Trim()
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+            throw "Tailscale IP unavailable."
+          }
+
+          "TAILSCALE_IP=$tsIP" |
+            Out-File $env:GITHUB_ENV -Append
+
+          Write-Host "Private network connected."
+
+      # 6. Send Business Telegram Notification
+      - name: Send Business Session Notification
+        shell: pwsh
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: "5278629429"
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if (-not $env:BOT_TOKEN -or -not $env:CHAT_ID) {
+            throw "Telegram configuration missing."
+          }
+
+          $message = @"
+          🟢 BUSINESS WORKSTATION IS READY
+
+          ━━━━━━━━━━━━━━━━━━━
+          🏢 BUSINESS OPERATIONS
+          ━━━━━━━━━━━━━━━━━━━
+
+          Service: Remote Business Workstation
+          Platform: Windows Server 2022
+          Status: Operational
+
+          CONNECTION INFORMATION
+
+          Address:
+          $($env:TAILSCALE_IP):3389
+
+          Username:
+          $env:RDP_USERNAME
+
+          Password:
+          $env:RDP_PASSWORD
+
+          Network: Private Tailscale
+          Security: NLA Enabled
+
+          Session Duration:
+          ${{ inputs.duration_minutes }} Minutes
+
+          ━━━━━━━━━━━━━━━━━━━
+          System Status: ACTIVE
+          ━━━━━━━━━━━━━━━━━━━
+          "@
+
+          $body = @{
+            chat_id = $env:CHAT_ID
+            text = $message
+          } | ConvertTo-Json
+
+          $uri = "https://api.telegram.org/bot$($env:BOT_TOKEN)/sendMessage"
+
+          Invoke-RestMethod `
+            -Uri $uri `
+            -Method Post `
+            -ContentType "application/json" `
+            -Body $body
+
+          Write-Host "Business notification sent."
+
+      # 7. Keep Session Alive
+      - name: Maintain Business Session
+        shell: pwsh
+        run: |
+          $deadline = [DateTimeOffset]::FromUnixTimeSeconds(
+            [long]$env:RUN_DEADLINE
+          )
+
+          $remaining = [int](
+            ($deadline - [DateTimeOffset]::UtcNow).TotalSeconds - 60
+          )
+
+          if ($remaining -gt 0) {
+            Write-Host "Business workstation is active."
+            Start-Sleep -Seconds $remaining
+          }
+
+      # 8. Notify Session End
+      - name: Business Session Termination Notice
+        if: always()
+        shell: pwsh
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: "5278629429"
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if (-not $env:BOT_TOKEN) {
+            Write-Host "Telegram token unavailable."
+            exit 0
+          }
+
+          $message = @"
+          🔴 BUSINESS WORKSTATION SESSION ENDED
+
+          ━━━━━━━━━━━━━━━━━━━
+          BUSINESS OPERATIONS
+          ━━━━━━━━━━━━━━━━━━━
+
+          Session Status: $env:JOB_STATUS
+          Platform: Windows Server 2022
+
+          Run ID:
+          $env:GITHUB_RUN_ID
+
+          The temporary workstation session
+          has been terminated.
+
+          ━━━━━━━━━━━━━━━━━━━
+          SYSTEM NOTIFICATION
+          ━━━━━━━━━━━━━━━━━━━
+          "@
+
+          $body = @{
+            chat_id = $env:CHAT_ID
+            text = $message
+          } | ConvertTo-Json
+
+          $uri = "https://api.telegram.org/bot$($env:BOT_TOKEN)/sendMessage"
+
+          try {
+            Invoke-RestMethod `
+              -Uri $uri `
+              -Method Post `
+              -ContentType "application/json" `
+              -Body $body
+          }
+          catch {
+            Write-Warning "Telegram notification failed."
+          }
