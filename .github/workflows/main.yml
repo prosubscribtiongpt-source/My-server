@@ -82,8 +82,8 @@ jobs:
             throw "RDP_PASSWORD secret is missing."
           }
 
-          if ($env:RDP_PASSWORD.Length -lt 14) {
-            throw "Password must contain at least 14 characters."
+          if ($env:RDP_PASSWORD.Length -lt 6) {
+            throw "Password must contain at least 6 characters."
           }
 
           $securePassword = ConvertTo-SecureString `
